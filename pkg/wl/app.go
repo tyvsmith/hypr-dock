@@ -1,6 +1,7 @@
 package wl
 
 import (
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -277,17 +278,15 @@ func (p *shmPool) Data() []byte {
 	return p.data
 }
 
+// Close releases the mapping, the compositor-side pool and the memfd. Every
+// step runs even when an earlier one fails, so a Destroy that cannot reach the
+// compositor still leaves no descriptor behind.
 func (p *shmPool) Close() error {
-	if err := unix.Munmap(p.data); err != nil {
-		return err
-	}
-	if err := p.Destroy(); err != nil {
-		return err
-	}
-	if err := unix.Close(p.fd); err != nil {
-		return err
-	}
-	return nil
+	return errors.Join(
+		unix.Munmap(p.data),
+		p.Destroy(),
+		unix.Close(p.fd),
+	)
 }
 
 func (a *App) handleDisplayError(evt client.DisplayErrorEvent) {
