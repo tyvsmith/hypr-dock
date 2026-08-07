@@ -157,6 +157,10 @@ func (pv *PV) show(item *item.Item) {
 	})
 
 	widget.OnReady(func(w, h int) {
+		if !pv.wants(widget) {
+			return
+		}
+
 		pv.popup.SetWinCallBack(func(window *gtk.Window) error {
 			return pv.popupWinSet(window)
 		})
@@ -216,6 +220,10 @@ func (pv *PV) change(item *item.Item) {
 	})
 
 	widget.OnReady(func(w, h int) {
+		if !pv.wants(widget) {
+			return
+		}
+
 		pv.popup.SetWinMoveCallBack(func(window *gtk.Window) error {
 			window.Resize(w, h+5)
 			return nil
@@ -290,6 +298,17 @@ func (pv *PV) OnLeave(handler func(w *gtk.Window, e *gdk.Event)) {
 
 func (pv *PV) OnEmpty(handler func()) {
 	pv.onEmpty = handler
+}
+
+// wants reports whether widget is still the preview that should be on screen.
+//
+// A capture resolves long after the hover that asked for it - a window the
+// compositor never answers takes seconds to time out - by which point the
+// pointer may have moved to another item or left the dock entirely. Opening
+// the popup then puts up a preview nobody asked for, and Hide has already run,
+// so nothing is left to take it back down.
+func (pv *PV) wants(widget *pvwidget.Widget) bool {
+	return pv.GetActive() && pv.widget == widget
 }
 
 func (pv *PV) SetActive(flag bool) {

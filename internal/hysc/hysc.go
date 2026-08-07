@@ -12,6 +12,14 @@ import (
 	"github.com/hashicorp/go-hclog"
 )
 
+// IsTransient reports a capture that failed for a reason that says nothing
+// about this dock: the window went away mid-export and the compositor answered
+// neither ready nor failed. Retrying another window is worthwhile; the failure
+// itself is routine.
+func IsTransient(err error) bool {
+	return errors.Is(err, wl.ErrCompositorTimeout)
+}
+
 // IsConnectionDead reports a capture that failed because the Wayland connection
 // behind it is gone. It never recovers, so a caller sharing one connection has
 // to capture through a new one or stop.
@@ -220,7 +228,7 @@ func (s *Stream) CaptureFrame() error {
 	if err != nil {
 		log.Printf("ERROR HYSC: Frame capture failed: %v", err)
 		app.Close()
-		return fmt.Errorf("failed to capture frame: %v", err)
+		return fmt.Errorf("failed to capture frame: %w", err)
 	}
 	log.Printf("DEBUG HYSC: Frame captured successfully, size: %dx%d", frame.Bounds().Dx(), frame.Bounds().Dy())
 

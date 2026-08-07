@@ -22,6 +22,8 @@ type Widget struct {
 	expectedCount int
 	totalWidth    int
 	commonHeight  int
+	notified      bool
+	destroyed     bool
 	mutex         sync.Mutex
 
 	settings *settings.Settings
@@ -53,6 +55,12 @@ func New(item *item.Item, settings *settings.Settings, log hclog.Logger) (*Widge
 
 		log: log,
 	}
+
+	// A capture resolves after the widget is built, so it can land once this
+	// box has been destroyed - the popup destroys its content on every open,
+	// and hovering another item opens a new one. Driving a callback from
+	// there would use a dead GTK object, so late arrivals are dropped.
+	wrapper.Connect("destroy", widget.invalidate)
 
 	log.Debug("Creating preview",
 		"class_name", item.ClassName,
@@ -178,11 +186,11 @@ func (w *Widget) createWindowWidget(window *ipc.Client) error {
 			}
 
 			w.mutex.Lock()
-			defer w.mutex.Unlock()
-
 			w.totalWidth = w.totalWidth - s.W - padding*2 - w.settings.ContextPos
+			width, height := w.totalWidth, w.commonHeight
+			w.mutex.Unlock()
 
-			w.onResize(w.totalWidth, w.commonHeight)
+			w.onResize(width, height)
 
 			windowBox.Destroy()
 			w.ShowAll()
@@ -190,17 +198,16 @@ func (w *Widget) createWindowWidget(window *ipc.Client) error {
 
 		glib.IdleAdd(func() {
 			w.mutex.Lock()
-			defer w.mutex.Unlock()
 
 			w.totalWidth += s.W
 			w.readyCount++
 			w.commonHeight = s.H
 
-			if w.readyCount == w.expectedCount {
-				w.totalWidth = w.totalWidth + w.settings.ContextPos*(w.expectedCount-1) + 2*padding*w.expectedCount
-				w.commonHeight = w.commonHeight + 2*padding + 20
+			notify := w.notifyIfReadyLocked(padding)
+			w.mutex.Unlock()
 
-				w.onReady(w.totalWidth, w.commonHeight)
+			if notify != nil {
+				notify()
 			}
 		})
 	})
@@ -209,13 +216,29 @@ func (w *Widget) createWindowWidget(window *ipc.Client) error {
 	stream.SetBorderRadius(w.settings.PreviewStyle.BorderRadius)
 
 	if w.settings.Preview.Mode == "live" {
-		err = stream.Start(w.settings.Preview.FPS, w.settings.Preview.BufferSize)
+		if err := stream.Start(w.settings.Preview.FPS, w.settings.Preview.BufferSize); err != nil {
+			return err
+		}
 	} else {
-		err = stream.CaptureFrame()
-	}
+		// Capture off the GTK main thread. This function runs inside a
+		// glib.IdleAdd callback, so a synchronous capture would block the
+		// main loop, freezing the whole dock until it returned. The result
+		// is applied via glib.IdleAdd from inside CaptureFrame.
+		go func() {
+			if err := stream.CaptureFrame(); err != nil {
+				// Racing a window that closes mid-capture is expected and
+				// self-correcting - it is dropped and the preview opens
+				// without it. Anything else is a genuine failure.
+				log := w.log.Error
+				if hysc.IsTransient(err) {
+					log = w.log.Warn
+				}
+				log("Frame capture failed",
+					"address", window.Address, "error", err)
 
-	if err != nil {
-		return err
+				glib.IdleAdd(func() { w.dropWindow(padding) })
+			}
+		}()
 	}
 
 	titleBox.Add(icon)
@@ -230,6 +253,62 @@ func (w *Widget) createWindowWidget(window *ipc.Client) error {
 	w.Add(windowBox)
 
 	return nil
+}
+
+// notifyIfReadyLocked returns the onReady call to make once every window still
+// in the tally has reported its size, or nil when the preview is not ready.
+//
+// The caller must hold w.mutex and must make that call after releasing it.
+// onReady opens the popup, which destroys the widget it is replacing - and
+// once this widget is the content, that is this widget. Its destroy handler
+// takes w.mutex, so running the callback under the lock deadlocks the GTK
+// main thread.
+func (w *Widget) notifyIfReadyLocked(padding int) func() {
+	if w.destroyed || w.notified || w.expectedCount <= 0 || w.readyCount != w.expectedCount {
+		return nil
+	}
+	w.notified = true
+
+	w.totalWidth = w.totalWidth + w.settings.ContextPos*(w.expectedCount-1) + 2*padding*w.expectedCount
+	w.commonHeight = w.commonHeight + 2*padding + 20
+
+	width, height := w.totalWidth, w.commonHeight
+	return func() { w.onReady(width, height) }
+}
+
+// dropWindow removes a window from the readiness tally after its capture
+// failed, so that one unresponsive window cannot stop the preview from
+// opening for the rest. Runs on the GTK main thread.
+func (w *Widget) dropWindow(padding int) {
+	w.mutex.Lock()
+	if w.destroyed {
+		w.mutex.Unlock()
+		return
+	}
+
+	w.expectedCount--
+
+	var notify func()
+	if w.expectedCount <= 0 {
+		notify = w.onEmpty
+	} else {
+		notify = w.notifyIfReadyLocked(padding)
+	}
+	w.mutex.Unlock()
+
+	if notify != nil {
+		notify()
+	}
+}
+
+// invalidate marks the widget unusable once GTK has destroyed its box. A
+// superseded preview must not drive the popup: onReady would reopen it around
+// destroyed content, and onEmpty would close the one now on screen.
+func (w *Widget) invalidate() {
+	w.mutex.Lock()
+	defer w.mutex.Unlock()
+
+	w.destroyed = true
 }
 
 func (w *Widget) OnResize(handler func(w, h int)) {
