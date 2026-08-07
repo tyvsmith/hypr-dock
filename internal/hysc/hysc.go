@@ -1,6 +1,7 @@
 package hysc
 
 import (
+	"errors"
 	"fmt"
 	"hypr-dock/pkg/wl"
 	"log"
@@ -10,6 +11,13 @@ import (
 	"github.com/gotk3/gotk3/gtk"
 	"github.com/hashicorp/go-hclog"
 )
+
+// IsConnectionDead reports a capture that failed because the Wayland connection
+// behind it is gone. It never recovers, so a caller sharing one connection has
+// to capture through a new one or stop.
+func IsConnectionDead(err error) bool {
+	return errors.Is(err, wl.ErrConnectionDead)
+}
 
 type Stream struct {
 	address string
@@ -177,6 +185,15 @@ func (s *Stream) Start(fps int, buferSize ...int) error {
 				s.size = size
 			})
 		}
+
+		// Frames closes either because Stop was called or because the
+		// connection died; only the second leaves an error behind, and it
+		// is terminal for this stream.
+		if err := stream.Err(); err != nil {
+			glib.IdleAdd(func() {
+				s.errorHandler(fmt.Errorf("preview stream ended: %w", err))
+			})
+		}
 	}()
 
 	s.Connect("destroy", func() {
@@ -271,7 +288,7 @@ func (s *Stream) CaptureFrameWithApp(app *wl.App) error {
 	frame, err := app.CaptureFrame(s.handle)
 	if err != nil {
 		log.Printf("ERROR HYSC: Frame capture failed: %v", err)
-		return fmt.Errorf("failed to capture frame: %v", err)
+		return fmt.Errorf("failed to capture frame: %w", err)
 	}
 	log.Printf("DEBUG HYSC: Frame captured successfully, size: %dx%d", frame.Bounds().Dx(), frame.Bounds().Dy())
 

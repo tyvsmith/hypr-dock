@@ -1,6 +1,7 @@
 package switcher
 
 import (
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -230,8 +231,19 @@ func (s *Switcher) UpdatePreviews() {
 			// Capture
 			if s.app != nil {
 				err = stream.CaptureFrameWithApp(s.app)
+
+				// The shared connection is dropped for good once a
+				// capture wedges on it, so the remaining previews get
+				// their own rather than all rendering blank.
+				if hysc.IsConnectionDead(err) {
+					err = stream.CaptureFrame()
+				}
 			} else {
 				err = stream.CaptureFrame()
+			}
+
+			if err != nil {
+				log.Printf("preview capture failed for %s: %v", client.Address, err)
 			}
 
 			if err == nil {

@@ -6,11 +6,34 @@ import (
 	"image"
 	"image/color"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hashicorp/go-hclog"
 	"github.com/pdf/go-wayland/client"
 	"golang.org/x/sys/unix"
+)
+
+const (
+	// The compositor answers CaptureToplevel with its supported formats
+	// straight away, so this only has to absorb scheduling jitter.
+	bufferDoneTimeout = 500 * time.Millisecond
+	// ready follows an actual copy of the window contents into shared
+	// memory, which can be slow on a busy GPU.
+	frameReadyTimeout = 2 * time.Second
+	roundTripTimeout  = 2 * time.Second
+)
+
+var (
+	// ErrCompositorTimeout reports an exchange the compositor never answered.
+	// Hyprland sends neither ready nor failed for a toplevel that is destroyed
+	// mid-export, so this is the expected outcome of racing a closing window
+	// rather than a fault.
+	ErrCompositorTimeout = errors.New(`compositor did not respond`)
+
+	// ErrConnectionDead reports a connection that has been torn down. It is
+	// terminal: an App never reconnects, so the owner has to build a new one.
+	ErrConnectionDead = errors.New(`wayland connection is no longer usable`)
 )
 
 type App struct {
@@ -19,6 +42,37 @@ type App struct {
 	shm      *client.Shm
 	tl       *HyprlandToplevelExportManagerV1
 	log      hclog.Logger
+
+	// dead is set once the connection has been torn down, so later calls fail
+	// fast instead of using a closed context. It is atomic because kill runs
+	// both from the caller awaiting a timeout and from handleDisplayError,
+	// which the dispatch goroutine invokes from inside Dispatch.
+	dead atomic.Bool
+}
+
+// waiter is a one-shot signal carrying the outcome of a Wayland event handler
+// back to whoever is pumping the event loop. Handlers run synchronously inside
+// Dispatch, so a settle is always visible to the dispatch loop's next
+// iteration.
+type waiter struct {
+	once sync.Once
+	ch   chan struct{}
+	err  error
+}
+
+func newWaiter() *waiter {
+	return &waiter{ch: make(chan struct{})}
+}
+
+func (w *waiter) settle(err error) {
+	w.once.Do(func() {
+		w.err = err
+		close(w.ch)
+	})
+}
+
+func (w *waiter) done() <-chan struct{} {
+	return w.ch
 }
 
 type shmPool struct {
@@ -30,6 +84,7 @@ type shmPool struct {
 type FrameStream struct {
 	Frames chan *image.NRGBA
 	stop   chan struct{}
+	err    error
 }
 
 func NewApp(log hclog.Logger) (*App, error) {
@@ -65,6 +120,12 @@ func NewApp(log hclog.Logger) (*App, error) {
 }
 
 func (a *App) StartStream(handle uint64, fps int, bufferSize int) (*FrameStream, error) {
+	// Preview.FPS is unvalidated config, and a zero would divide by zero
+	// below rather than fail here.
+	if fps <= 0 {
+		return nil, fmt.Errorf(`fps must be positive, got %d`, fps)
+	}
+
 	stream := &FrameStream{
 		Frames: make(chan *image.NRGBA, bufferSize),
 		stop:   make(chan struct{}),
@@ -82,7 +143,16 @@ func (a *App) StartStream(handle uint64, fps int, bufferSize int) (*FrameStream,
 			case <-ticker.C:
 				frame, err := a.CaptureFrame(handle)
 				if err != nil {
-					a.log.Trace("Capture error: %v", err)
+					// A dead connection never revives, so ticking on would
+					// spin against a closed socket forever. End the stream
+					// instead and let the owner build a new App.
+					if a.dead.Load() {
+						stream.err = err
+						close(stream.Frames)
+						return
+					}
+
+					a.log.Trace(`capture error`, `err`, err)
 					continue
 				}
 
@@ -98,56 +168,57 @@ func (a *App) StartStream(handle uint64, fps int, bufferSize int) (*FrameStream,
 	return stream, nil
 }
 
+// Err reports why the stream ended. It is only meaningful once Frames has been
+// closed, and is nil for a stream ended by Stop.
+func (s *FrameStream) Err() error {
+	return s.err
+}
+
 func (s *FrameStream) Stop() {
 	close(s.stop)
 }
 
 func (a *App) CaptureFrame(handle uint64) (*image.NRGBA, error) {
+	if a.dead.Load() {
+		return nil, ErrConnectionDead
+	}
 	if a.tl == nil {
-		return nil, fmt.Errorf(`toplevel export manager not available`)
+		return nil, errors.New(`toplevel export manager not available`)
 	}
 
 	frame, err := a.tl.CaptureToplevel(0, uint32(handle))
 	if err != nil {
 		return nil, err
 	}
-	defer func() {
-		if err := frame.Destroy(); err != nil {
-			a.log.Error(`failed destroying frame`, `err`, err)
-		}
-	}()
+	defer func() { a.teardown(`failed destroying frame`, frame.Destroy()) }()
 
 	formats := make([]HyprlandToplevelExportFrameV1BufferEvent, 0)
-	done := make(chan struct{})
-	ready := make(chan struct{})
-	failed := make(chan error, 1)
+	bufferDone := newWaiter()
+	ready := newWaiter()
+
 	frame.SetBufferHandler(func(evt HyprlandToplevelExportFrameV1BufferEvent) {
 		formats = append(formats, evt)
 	})
 	frame.SetBufferDoneHandler(func(evt HyprlandToplevelExportFrameV1BufferDoneEvent) {
-		close(done)
+		bufferDone.settle(nil)
 	})
 	frame.SetReadyHandler(func(evt HyprlandToplevelExportFrameV1ReadyEvent) {
-		close(ready)
+		ready.settle(nil)
 	})
 	frame.SetFailedHandler(func(evt HyprlandToplevelExportFrameV1FailedEvent) {
-		failed <- fmt.Errorf(`frame failed`)
+		// The compositor can fail the capture at either stage, so settle
+		// both; settle is idempotent and only the pending one is awaited.
+		err := errors.New(`compositor reported frame capture failure`)
+		bufferDone.settle(err)
+		ready.settle(err)
 	})
 
-	if err := a.roundTrip(); err != nil {
+	if err := a.dispatchUntil(bufferDone, bufferDoneTimeout); err != nil {
 		return nil, err
-	}
-
-	select {
-	case <-done:
-	case err := <-failed:
-		return nil, err
-	case <-time.After(500 * time.Millisecond):
-		return nil, fmt.Errorf("timeout waiting for buffer events")
 	}
 
 	if len(formats) == 0 {
-		return nil, fmt.Errorf(`no buffer formats`)
+		return nil, errors.New(`no buffer formats`)
 	}
 
 	a.log.Debug("Available buffer formats:", "count", len(formats))
@@ -175,57 +246,35 @@ OUTER:
 	}
 
 	if selected == nil {
-		return nil, fmt.Errorf(`no suitable buffer format`)
+		return nil, errors.New(`no suitable buffer format`)
 	}
 
 	pool, err := a.createShmPool(int32(selected.Height * selected.Stride))
 	if err != nil {
 		return nil, err
 	}
-	defer func() {
-		if err := pool.Close(); err != nil {
-			a.log.Error(`failed closing SHM pool`, `err`, err)
-		}
-	}()
+	defer func() { a.teardown(`failed closing SHM pool`, pool.Close()) }()
 
 	buf, err := pool.CreateBuffer(0, int32(selected.Width), int32(selected.Height), int32(selected.Stride), selected.Format)
 	if err != nil {
 		return nil, err
 	}
-	defer func() {
-		if err := buf.Destroy(); err != nil {
-			a.log.Error(`failed destroying buffer`, `err`, err)
-		}
-	}()
+	defer func() { a.teardown(`failed destroying buffer`, buf.Destroy()) }()
 
 	if err := frame.Copy(buf, 1); err != nil {
 		return nil, err
 	}
 
-	// Actively dispatch events while waiting for the frame to be ready.
-	// The compositor sends the ready event asynchronously after copying
-	// the frame data, so we must keep dispatching to receive it.
-	timeout := time.After(2 * time.Second)
-	for {
-		select {
-		case <-ready:
-			goto frameReady
-		case err := <-failed:
-			return nil, err
-		case <-timeout:
-			return nil, fmt.Errorf("timeout waiting for frame ready")
-		default:
-			if err := a.display.Context().Dispatch(); err != nil {
-				return nil, fmt.Errorf("dispatch error while waiting for frame: %w", err)
-			}
-		}
+	// The compositor sends ready asynchronously once it has copied the frame
+	// data, so events must keep being dispatched until it arrives.
+	if err := a.dispatchUntil(ready, frameReadyTimeout); err != nil {
+		return nil, err
 	}
-frameReady:
 
 	data := pool.Data()
 	img := image.NewNRGBA(image.Rect(0, 0, int(selected.Width), int(selected.Height)))
 	if len(img.Pix) < int(selected.Height)*int(selected.Stride) {
-		return nil, fmt.Errorf(`image buffer too small`)
+		return nil, errors.New(`image buffer too small`)
 	}
 	for y := range int(selected.Height) {
 		for x := range int(selected.Width) {
@@ -251,6 +300,10 @@ frameReady:
 }
 
 func (a *App) Close() error {
+	// Nothing to send once the socket is gone.
+	if a.dead.Load() {
+		return nil
+	}
 	if a.tl != nil {
 		if err := a.tl.Destroy(); err != nil {
 			return err
@@ -289,15 +342,27 @@ func (p *shmPool) Close() error {
 	)
 }
 
-func (a *App) handleDisplayError(evt client.DisplayErrorEvent) {
-	a.log.Trace("Display error occurred", "error", evt)
-
-	err := a.reconnect()
-	if err != nil {
-		a.log.Trace("Reconnection failed", "error", err)
+// teardown reports a cleanup request that failed. On a dropped connection every
+// request fails with the same write error, which describes the teardown rather
+// than the capture, so those are logged at trace.
+func (a *App) teardown(msg string, err error) {
+	if err == nil {
+		return
 	}
+	if a.dead.Load() {
+		a.log.Trace(msg, `err`, err)
+		return
+	}
+	a.log.Error(msg, `err`, err)
+}
 
-	a.log.Trace("Successfully reconnected to Wayland display")
+func (a *App) handleDisplayError(evt client.DisplayErrorEvent) {
+	// This runs inside Dispatch, on the goroutine currently reading the
+	// connection. Reconnecting here would close and replace the display out
+	// from under that reader, so the connection is only marked unusable;
+	// callers create a fresh App per capture.
+	a.log.Error(`wayland display error, connection is now unusable`, `error`, evt)
+	a.kill()
 }
 
 func (a *App) handleShmFormat(evt client.ShmFormatEvent) {
@@ -333,32 +398,6 @@ func (a *App) handleRegistryGlobal(evt client.RegistryGlobalEvent) {
 	}
 }
 
-func (a *App) reconnect() error {
-	a.Close()
-
-	display, err := client.Connect("")
-	if err != nil {
-		return fmt.Errorf("failed to reconnect: %w", err)
-	}
-
-	registry, err := display.GetRegistry()
-	if err != nil {
-		return fmt.Errorf("failed to get registry: %w", err)
-	}
-
-	a.display = display
-	a.registry = registry
-
-	display.SetErrorHandler(a.handleDisplayError)
-	registry.SetGlobalHandler(a.handleRegistryGlobal)
-
-	if err := a.roundTrip(); err != nil {
-		return err
-	}
-
-	return a.roundTrip()
-}
-
 func (a *App) createShmPool(size int32) (*shmPool, error) {
 	fd, err := unix.MemfdCreate("hypr-dock-shm", 0)
 	if err != nil {
@@ -385,31 +424,76 @@ func (a *App) createShmPool(size int32) (*shmPool, error) {
 	}, nil
 }
 
-func (a *App) roundTrip() error {
-	var dispatchMutex sync.Mutex
+// dispatchUntil pumps Wayland events until w settles or timeout elapses.
+//
+// Context.Dispatch blocks in a read with no deadline, so the loop has to run on
+// its own goroutine for the timeout to be observable at all. Callers must not
+// overlap two dispatchUntil calls on one App: go-wayland reads a message header
+// and body in two steps without a lock, so a second reader would interleave
+// with the first and desynchronise the framing.
+func (a *App) dispatchUntil(w *waiter, timeout time.Duration) error {
+	if a.dead.Load() {
+		return ErrConnectionDead
+	}
 
+	dispatchErr := make(chan error, 1)
+	go func() {
+		for {
+			// Handlers settle w from inside Dispatch, so checking here
+			// before blocking again terminates the loop as soon as the
+			// awaited event lands.
+			select {
+			case <-w.done():
+				return
+			default:
+			}
+
+			if err := a.display.Context().Dispatch(); err != nil {
+				dispatchErr <- err
+				return
+			}
+		}
+	}()
+
+	select {
+	case <-w.done():
+		return w.err
+
+	case err := <-dispatchErr:
+		return fmt.Errorf(`wayland dispatch failed: %w`, err)
+
+	case <-time.After(timeout):
+		// The reader is parked in a blocking read that no deadline can
+		// interrupt; closing the connection is the only way to release it.
+		// A capture that has already wedged cannot be resumed anyway.
+		a.log.Warn(`compositor did not respond, dropping connection`, `timeout`, timeout)
+		a.kill()
+		return fmt.Errorf(`%w after %s`, ErrCompositorTimeout, timeout)
+	}
+}
+
+// kill tears down the connection to release a reader blocked in Dispatch. It is
+// safe to call from either goroutine and only the first call closes.
+func (a *App) kill() {
+	if a.dead.Swap(true) {
+		return
+	}
+	if err := a.display.Context().Close(); err != nil {
+		a.log.Trace(`failed closing wayland context`, `err`, err)
+	}
+}
+
+func (a *App) roundTrip() error {
 	cb, err := a.display.Sync()
 	if err != nil {
 		return err
 	}
 	defer cb.Destroy()
 
-	done := make(chan struct{})
+	w := newWaiter()
 	cb.SetDoneHandler(func(_ client.CallbackDoneEvent) {
-		close(done)
+		w.settle(nil)
 	})
 
-	dispatchMutex.Lock()
-	defer dispatchMutex.Unlock()
-
-	for {
-		select {
-		case <-done:
-			return nil
-		default:
-			if err := a.display.Context().Dispatch(); err != nil {
-				a.log.Trace(`dispatch error`, `err`, err)
-			}
-		}
-	}
+	return a.dispatchUntil(w, roundTripTimeout)
 }
